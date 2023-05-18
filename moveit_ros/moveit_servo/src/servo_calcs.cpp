@@ -274,6 +274,12 @@ void ServoCalcs::start()
 
 void ServoCalcs::stop()
 {
+    if (servo_params_.command_in_type == "velocity") {
+        std_msgs::msg::Float64MultiArray msg;
+        msg.data = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        multiarray_outgoing_cmd_pub_->publish(msg);
+    }
+
   // Request stop
   stop_requested_ = true;
 
@@ -529,51 +535,68 @@ bool ServoCalcs::cartesianServoCalcs(geometry_msgs::msg::TwistStamped& cmd,
     transformTwistToPlanningFrame(cmd, servo_params_.planning_frame, current_state_, *node_->get_clock());
   }
 
-  Eigen::VectorXd delta_x = scaleCartesianCommand(cmd);
-
+  Eigen::VectorXd delta_x;
   Eigen::MatrixXd jacobian = current_state_->getJacobian(joint_model_group_);
-
-  removeDriftDimensions(jacobian, delta_x);
-
-  Eigen::JacobiSVD<Eigen::MatrixXd> svd =
-      Eigen::JacobiSVD<Eigen::MatrixXd>(jacobian, Eigen::ComputeThinU | Eigen::ComputeThinV);
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd = Eigen::JacobiSVD<Eigen::MatrixXd>(jacobian, Eigen::ComputeThinU | Eigen::ComputeThinV);
   Eigen::MatrixXd matrix_s = svd.singularValues().asDiagonal();
   Eigen::MatrixXd pseudo_inverse = svd.matrixV() * matrix_s.inverse() * svd.matrixU().transpose();
 
-  // Convert from cartesian commands to joint commands
-  // Use an IK solver plugin if we have one, otherwise use inverse Jacobian.
-  if (ik_solver_)
+  removeDriftDimensions(jacobian, delta_x);
+
+  if (servo_params_.command_interface == "position")
   {
-    const Eigen::Isometry3d base_to_tip_frame_transform =
-        current_state_->getGlobalLinkTransform(ik_solver_->getBaseFrame()).inverse() *
-        current_state_->getGlobalLinkTransform(ik_solver_->getTipFrame());
+      delta_x = scaleCartesianCommand(cmd);
 
-    geometry_msgs::msg::Pose next_pose = poseFromCartesianDelta(delta_x, base_to_tip_frame_transform);
 
-    // setup for IK call
-    std::vector<double> solution(num_joints_);
-    moveit_msgs::msg::MoveItErrorCodes err;
-    kinematics::KinematicsQueryOptions opts;
-    opts.return_approximate_solution = true;
-    if (ik_solver_->searchPositionIK(next_pose, current_joint_state_.position, servo_params_.publish_period / 2.0,
-                                     solution, err, opts))
-    {
-      // find the difference in joint positions that will get us to the desired pose
-      for (size_t i = 0; i < num_joints_; ++i)
+      // Convert from cartesian commands to joint commands
+      // Use an IK solver plugin if we have one, otherwise use inverse Jacobian.
+      if (ik_solver_)
       {
-        delta_theta_.coeffRef(i) = solution.at(i) - current_joint_state_.position.at(i);
+          const Eigen::Isometry3d base_to_tip_frame_transform =
+                  current_state_->getGlobalLinkTransform(ik_solver_->getBaseFrame()).inverse() *
+                  current_state_->getGlobalLinkTransform(ik_solver_->getTipFrame());
+
+          geometry_msgs::msg::Pose next_pose = poseFromCartesianDelta(delta_x, base_to_tip_frame_transform);
+
+          // setup for IK call
+          std::vector<double> solution(num_joints_);
+          moveit_msgs::msg::MoveItErrorCodes err;
+          kinematics::KinematicsQueryOptions opts;
+          opts.return_approximate_solution = true;
+          if (ik_solver_->searchPositionIK(next_pose, current_joint_state_.position, servo_params_.publish_period / 2.0,
+                                           solution, err, opts))
+          {
+              // find the difference in joint positions that will get us to the desired pose
+              for (size_t i = 0; i < num_joints_; ++i)
+              {
+                  delta_theta_.coeffRef(i) = solution.at(i) - current_joint_state_.position.at(i);
+              }
+          }
+          else
+          {
+              RCLCPP_WARN(LOGGER, "Could not find IK solution for requested motion, got error code %d", err.val);
+              return false;
+          }
       }
-    }
-    else
-    {
-      RCLCPP_WARN(LOGGER, "Could not find IK solution for requested motion, got error code %d", err.val);
-      return false;
-    }
+      else
+      {
+          // no supported IK plugin, use inverse Jacobian
+          delta_theta_ = pseudo_inverse * delta_x;
+      }
   }
-  else
+  else if (servo_params_.command_interface ==  "velocity")
   {
-    // no supported IK plugin, use inverse Jacobian
-    delta_theta_ = pseudo_inverse * delta_x;
+    delta_x[0] = cmd.twist.linear.x;
+    delta_x[1] = cmd.twist.linear.y;
+    delta_x[2] = cmd.twist.linear.z;
+    delta_x[3] = cmd.twist.angular.x;
+    delta_x[4] = cmd.twist.angular.y;
+    delta_x[5] = cmd.twist.angular.z;
+    delta_theta_ = jacobian * delta_x;
+  } else
+  {
+      rclcpp::Clock& clock = *node_->get_clock();
+      RCLCPP_ERROR_STREAM_THROTTLE(LOGGER, clock, ROS_LOG_THROTTLE_PERIOD, "Unexpected command_interface");
   }
 
   delta_theta_ *= velocityScalingFactorForSingularity(joint_model_group_, delta_x, svd, pseudo_inverse,
@@ -626,10 +649,20 @@ bool ServoCalcs::internalServoUpdate(Eigen::ArrayXd& delta_theta,
   }
   delta_theta *= collision_scale;
 
-  // Loop through joints and update them, calculate velocities, and filter
-  if (!applyJointUpdate(*node_->get_clock(), servo_params_.publish_period, delta_theta, previous_joint_state_,
-                        next_joint_state_, smoother_))
-    return false;
+  if (servo_params_.command_interface == "position") {
+      // Loop through joints and update them, calculate velocities, and filter
+      if (!applyJointUpdate(*node_->get_clock(), servo_params_.publish_period, delta_theta, previous_joint_state_,
+                            next_joint_state_, smoother_))
+          return false;
+  }
+  else if (servo_params_.command_interface == "velocity")
+  {
+      for (std::size_t i = 0; i < next_joint_state_.velocity.size(); ++i)
+      {
+          next_joint_state_.velocity[i] = delta_theta[i];
+      }
+//      smoother->doSmoothing(next_joint_state_.velocity);
+  }
 
   // Mark the lowpass filters as updated for this cycle
   updated_filters_ = true;

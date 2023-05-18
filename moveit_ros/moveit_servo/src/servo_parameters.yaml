@@ -59,6 +59,15 @@ servo:
   }
 
 ################################ INPUTS  #############################
+  command_interface: {
+    type: string,
+    default_value: "position",
+    description: "The command interface.",
+    validation: {
+      one_of<>: [ [ "position", "velocity" ] ]
+    }
+  }
+
   cartesian_command_in_topic: {
     type: string,
     default_value: "~/delta_twist_cmds",
